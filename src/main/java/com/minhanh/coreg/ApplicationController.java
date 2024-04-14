@@ -2,20 +2,23 @@ package com.minhanh.coreg;
 
 import java.util.*;
 
-import com.minhanh.coreg.transfactor.Transfactor;
-import com.minhanh.coreg.transfactor.TransfactorService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.ui.ModelMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.ModelAndView;
 
-@RestController
-public class ApplicationController {
-	@Autowired
-	private TransfactorService transfactorService;
+import org.neo4j.driver.GraphDatabase;
+import org.neo4j.driver.AuthTokens;
+import org.neo4j.driver.Driver;
+import org.neo4j.driver.Query;
+import org.neo4j.driver.Record;
 
+import static org.neo4j.driver.Values.parameters;
+
+@RestController
+public class ApplicationController implements AutoCloseable{
+	private Driver driver;
 	@GetMapping("/")
 	public ModelAndView rootView() {
 		ModelAndView mav = new ModelAndView();
@@ -38,47 +41,51 @@ public class ApplicationController {
 		return coregulatingGraph(genes_list, min);
 	}
 
+	private void makeConnection() {
+		String uri = "bolt://localhost:7687";
+		String username = "neo4j";
+		String password = "coregulation";
+
+		try (var driver = GraphDatabase.driver(uri, AuthTokens.basic(username, password))) { //1
+			driver.verifyConnectivity(); //2
+			this.driver = driver;
+		}
+	}
+	@Override
+	public void close() throws RuntimeException {
+		driver.close();
+	}
+
 	private Map<String, List<? extends Map<String, ?>>> coregulatingGraph(String[] genes_list, byte min) {
-		List<Transfactor> all_regulations = transfactorService.filterByGenes(genes_list);
-		Map<String, Set<String>> regulating_map = new HashMap<>();
-
-		for (Transfactor regulation : all_regulations) {
-			String reg_factor = regulation.getRegulatoryFactor();
-			String tar_gene = regulation.getTargetGene();
-			if (regulating_map.get(reg_factor) == null) {
-				regulating_map.put(reg_factor, new HashSet<>(Arrays.asList(tar_gene)));
-			} else regulating_map.get(reg_factor).add(tar_gene);
-		}
-
-		Set<String> nodes_set = new HashSet<>();
-		List<Map<String,Object>> links_list = new ArrayList<>();
-
-		List<String> key_list = new ArrayList<>(regulating_map.keySet());
-		ListIterator<String> itr = key_list.listIterator(0);
-		while (itr.hasNext()) {
-			String tf = itr.next();
-			Set<String> genes_1 = regulating_map.get(tf);
-			ListIterator<String> itr_next = key_list.listIterator(itr.nextIndex());
-			itr_next.forEachRemaining(other_tf -> {
-				Set<String> genes_2 = regulating_map.get(other_tf);
-				Set<String> intersect = new HashSet<>(genes_1);
-				intersect.retainAll(genes_2);
-				int inter_count = intersect.size();
-				if (inter_count >= min) {
-					nodes_set.add(tf);
-					nodes_set.add(other_tf);
-					links_list.add(Map.of("source", tf, "target", other_tf, "value", inter_count));
+		try (var session = driver.session()) {
+			return session.executeWrite(tx -> {
+				var query = new Query(
+						"MATCH (t1:TransFactor)-[:REGULATES]->(a:Gene)<-[:REGULATES]-(t2:TransFactor) \n" +
+								"WHERE a.symbol IN $list AND t1 <> t2 \n" +
+								"WITH t1, t2, count(DISTINCT a) AS n \n" +
+								"WHERE n >= $min \n" +
+								"RETURN t1.symbol AS u, t2.symbol AS v, n", parameters("list", genes_list, "min", min));
+				var links_result = tx.run(query);
+				List<Map<String,String>> nodes_list = new ArrayList<>();
+				List<Map<String,Object>> links_list = new ArrayList<>();
+				while (links_result.hasNext()) {
+					Record record = links_result.next();
+					String u = record.get("u").asString();
+					String v = record.get("v").asString();
+					Integer n = record.get("n").asInt();
+					Map<String,String> map_node_1 = Map.of("id", u);
+					Map<String,String> map_node_2 = Map.of("id", v);
+					Map<String,Object> map_link_1 = Map.of("source", u, "target", v, "value", n);
+					Map<String,Object> map_link_2 = Map.of("source", v, "target", u, "value", n);
+					if (!nodes_list.contains(map_node_1)) nodes_list.add(map_node_1);
+					if (!nodes_list.contains(map_node_2)) nodes_list.add(map_node_2);
+					if (!links_list.contains(map_link_1) & !links_list.contains(map_link_2)) links_list.add(map_link_1);
 				}
+				return Map.of("nodes", nodes_list, "links", links_list);
 			});
-		}
-
-		if (nodes_set.isEmpty() || links_list.isEmpty()) return new HashMap<>();
-		else {
-			List<Map<String,String>> nodes_list = new ArrayList<>();
-			for (String tf : nodes_set) {
-				nodes_list.add(Map.of("id", tf));
-			}
-			return Map.of("nodes", nodes_list, "links", links_list);
+		} catch (Exception e) {
+			System.out.println(e.getMessage());
+			return Map.of("input", List.of(Map.of("gene_list", genes_list), Map.of("min", min)));
 		}
 	}
 }
