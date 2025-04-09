@@ -1,20 +1,20 @@
-var svg = document.querySelector("svg");
-var width = svg.getBoundingClientRect().width,
-    height = svg.getBoundingClientRect().height;
-
 const graphUrl = "/graph" + window.location.search
 
-const stompClient = new StompJs.Client({
-    brokerURL: 'ws://localhost:8080/transfactor'
-});
-
 const data = await d3.json(graphUrl);
-if (JSON.stringify(data) == "{}") {
-    window.location.href = "/";
+if (data.error) {
+    var main_area = document.querySelector("#main");
+    result_area.innerHTML = '';
+    var div = document.createElement('div');
+    var head = document.createElement('h3');
+    head.innerHTML = 'Error';
+    div.appendChild(head);
+    var e = document.createElement('div');
+    e.appendChild(document.createTextNode(data.error));
+    div.appendChild(e);
+    result_area.appendChild(div);
 }
 else {
     console.log(data);
-    connect();
 }
 
 // Specify the color scale.
@@ -25,6 +25,10 @@ const color = d3.scaleOrdinal(d3.schemeCategory10);
 const links = data.links.map(d => ({ ...d }));
 const nodes = data.nodes.map(d => ({ ...d }));
 
+var grapharea = d3.select("#graph-area");
+var width = grapharea.node().getBoundingClientRect().width,
+    height = 600;
+
 // Create a simulation with several forces.
 const simulation = d3.forceSimulation(nodes).alphaDecay(1 - 0.001 ** (1 / (links.length * 5)))
     .force("link", d3.forceLink(links).id(d => d.id))
@@ -33,8 +37,7 @@ const simulation = d3.forceSimulation(nodes).alphaDecay(1 - 0.001 ** (1 / (links
     .on("tick", ticked);
 
 // Create the SVG container.
-svg = d3.select("svg")
-    .attr("width", width)
+var svg = grapharea.append("svg")
     .attr("height", height)
     .attr("viewBox", [0, 0, width, height])
     .attr("style", "max-width: 100%; height: auto;");
@@ -54,8 +57,10 @@ const node = svg.append("g")
     .selectAll()
     .data(nodes)
     .join("circle")
-    .attr("r", 5)
-    .attr("fill", "#ef6603");
+    .attr("r", 15)
+    .attr("fill", "#ef6603")
+    .style("cursor", "pointer")
+    .on("click", clicked);
 
 node.append("title")
     .text(d => d.id);
@@ -79,12 +84,20 @@ function ticked() {
         .attr("cy", d => d.y);
 }
 
+function clicked(event, d) {
+    if (event.defaultPrevented) return; // dragged
+    d3.select(this).transition()
+        .attr("r", 24)
+        .transition()
+        .attr("r", 15);
+    sendName(d.id);
+}
+
 // Reheat the simulation when drag starts, and fix the subject position.
 function dragstarted(event) {
     if (!event.active) simulation.alphaTarget(0.3).restart();
     event.subject.fx = event.subject.x;
     event.subject.fy = event.subject.y;
-    sendName(event.subject.id);
 }
 
 // Update the subject (dragged node) position during drag.
@@ -97,9 +110,16 @@ function dragged(event) {
 // Unfix the subject position now that it’s no longer being dragged.
 function dragended(event) {
     if (!event.active) simulation.alphaTarget(0);
+    d3.select(this).attr("stroke", "#fff");
     event.subject.fx = null;
     event.subject.fy = null;
 }
+
+const stompClient = new StompJs.Client({
+    brokerURL: 'ws://localhost:8080/transfactor'
+});
+
+connect();
 
 //stompClient.activate();
 
@@ -133,49 +153,81 @@ function disconnect() {
 function sendName(name) {
     stompClient.publish({
         destination: "/app/transfactor",
-        body: JSON.stringify({'id': name})
+        body: JSON.stringify({ 'id': name })
     });
+    var result_area = document.querySelector("#info-area");
+    result_area.innerHTML = '<div><p>Please wait...</p></div>';
 }
 
 function showNodeInfo(nodeinfo) {
-    var result_area = document.querySelector("#result-area");
-    result_area.innerHTML = '';
-    var div = document.createElement('div');
-    var head = document.createElement('h3');
-    head.innerHTML = 'Trans-factor information: ';
-    div.appendChild(head);
-
-    var rbp = nodeinfo.rbp;
-    for (const [key, value] of Object.entries(rbp)) {
-        var e = document.createElement('div');
-        e.appendChild(document.createTextNode(properDisplay(key) + ' : ' + value));
-        div.appendChild(e);
-    }
-    result_area.appendChild(div);
-
     console.log(nodeinfo);
-    var rbp = JSON.parse(nodeinfo.rbp);
+    var result_area = document.querySelector("#info-area");
+    result_area.innerHTML = '';
+    var table = document.createElement('table'),
+        tbody = document.createElement('tbody');
 
+    var rbp = nodeinfo.transFactorEntity;
+    for (const [key, value] of Object.entries(rbp)) {
+        var tr = document.createElement('tr'),
+            th = document.createElement('th'),
+            td = document.createElement('td');
+        th.appendChild(document.createTextNode(properDisplay(key)));
+        td.appendChild(document.createTextNode(value));
+        tr.appendChild(th); tr.appendChild(td);
+        tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    result_area.appendChild(table);
 }
 
 function properDisplay(field) {
     switch (field) {
-        case 'annotationId' :
+        case 'annotationId':
             return 'Annotation ID';
-            break;
-        case 'geneSymbol' :
+        case 'geneSymbol':
             return 'Gene symbol';
-            break;
-        case 'geneId' :
+        case 'geneId':
             return 'Gene ID';
-            break;
-        case 'description' :
+        case 'description':
             return 'Description';
-            break;
-        case 'synonyms' :
+        case 'synonyms':
             return 'Synonyms';
-            break;
-        default :
-            return '';
+        default:
+            return field;
     }
 }
+
+const neighbours = {};
+
+nodes.forEach((node) => {
+    neighbours[node.id] = neighbours[node.id] || [];
+});
+
+links.forEach((link) => {
+    neighbours[link.source.id].push(link.target.id);
+    neighbours[link.target.id].push(link.source.id);
+});
+
+const degrees = Object.fromEntries(Object.keys(neighbours).map(k => [k, neighbours[k].length]));
+
+const minDegree = Math.min(...Object.values(degrees));
+const maxDegree = Math.max(...Object.values(degrees));
+
+function normalize(val, minval, maxval) {
+    return (val - minval) / (maxval - minval);
+}
+
+const keysSorted = Object.keys(degrees).sort((a, b) => degrees[b] - degrees[a]);
+
+const degreeCentralities = Object.fromEntries(keysSorted.map(k => [k, normalize(degrees[k], minDegree, maxDegree)]));
+
+document.querySelectorAll('input[type="radio"][name="method"]').forEach((button) => {
+    button.addEventListener('change', function () {
+        if (this.checked) {
+            if (this.value == "degree") {
+                node.transition()
+                    .attr("fill", d => d3.hsv(25, 0.99, degreeCentralities[d.id]))
+            }
+        }
+    });
+});
